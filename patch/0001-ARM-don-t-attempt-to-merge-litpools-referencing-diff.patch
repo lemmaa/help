@@ -1,0 +1,105 @@
+From 2d0609ea5461dc735ff58d9bb138711bc80a4431 Mon Sep 18 00:00:00 2001
+From: Geunsik Lim <geunsik.lim@samsung.com>
+Date: Thu, 18 May 2016 15:19:24 +0900
+Subject: ARM: don't attempt to merge litpools referencing different PC-anchors.
+
+Given something like:
+
+    ldr r0, .LCPI0_0 (== pc-rel var)
+    add r0, pc
+
+    ldr r1, .LCPI0_1 (== pc-rel var)
+    add r1, pc
+
+we cannot combine the 2 ldr instructions and litpools because they get added to
+a different pc to form the correct address. I think the original logic came
+from a time when we fused the LDRpci/PICADD instructions into one pseudo-instruction
+so the PC was always immediately at-hand. That's no longer the case.
+
+Should fix general-dynamic TLS access on Linux, and quite possibly other '-fPIC'
+code that relies on litpools (e.g. v6m and -Oz compilations) though trivial
+tweaks of the .ll test didn't provoke anything.
+
+Signed-off-by: Tim Northover <tnorthover.gmail.com>
+Reviewed-by: Geunsik Lim <geunsik.lim@samsung.com>
+Reported-by: Geunsik Lim <geunsik.lim@samsung.com>
+Evaluated-by: Geunsik Lim <geunsik.lim@samsung.com>
+---
+ lib/Target/ARM/ARMConstantPoolValue.cpp |  6 ++---
+ test/CodeGen/ARM/litpool-licm.ll        | 46 +++++++++++++++++++++++++++++++++
+ 2 files changed, 49 insertions(+), 3 deletions(-)
+ create mode 100644 test/CodeGen/ARM/litpool-licm.ll
+
+diff --git a/lib/Target/ARM/ARMConstantPoolValue.cpp b/lib/Target/ARM/ARMConstantPoolValue.cpp
+index 7d41c69..866ca82 100644
+--- a/lib/Target/ARM/ARMConstantPoolValue.cpp
++++ b/lib/Target/ARM/ARMConstantPoolValue.cpp
+@@ -75,9 +75,9 @@ bool
+ ARMConstantPoolValue::hasSameValue(ARMConstantPoolValue *ACPV) {
+   if (ACPV->Kind == Kind &&
+       ACPV->PCAdjust == PCAdjust &&
+-      ACPV->Modifier == Modifier) {
+-    if (ACPV->LabelId == LabelId)
+-      return true;
++      ACPV->Modifier == Modifier &&
++      ACPV->LabelId == LabelId &&
++      ACPV->AddCurrentAddress == AddCurrentAddress) {
+     // Two PC relative constpool entries containing the same GV address or
+     // external symbols. FIXME: What about blockaddress?
+     if (Kind == ARMCP::CPValue || Kind == ARMCP::CPExtSymbol)
+diff --git a/test/CodeGen/ARM/litpool-licm.ll b/test/CodeGen/ARM/litpool-licm.ll
+new file mode 100644
+index 0000000..dc6b37f
+--- /dev/null
++++ b/test/CodeGen/ARM/litpool-licm.ll
+@@ -0,0 +1,46 @@
++; RUN: llc -mtriple=thumbv7-linux-gnueabihf -relocation-model=pic %s -o - | FileCheck %s
++
++@var = thread_local global i32 0, align 4
++
++define void @func(i32 %n) {
++; CHECK-LABEL: func:
++; CHECK: ldr [[REF1:r[0-9]+]], [[CP1:.LCPI[0-9]+_[0-9]+]]
++; CHECK: ldr [[REF2:r[0-9]+]], [[CP2:.LCPI[0-9]+_[0-9]+]]
++
++; CHECK: [[PCPOS1:.LPC[0-9]+_[0-9]+]]:
++; CHECK-NEXT: add [[REF1]], pc
++
++; CHECK: [[PCPOS2:.LPC[0-9]+_[0-9]+]]:
++; CHECK-NEXT: add [[REF2]], pc
++
++; CHECK: [[CP1]]:
++; CHECK-NEXT: [[CP1_TMP:.Ltmp[0-9]+]]:
++; CHECK-NEXT:     .long var(TLSGD)-(([[PCPOS1]]+4)-[[CP1_TMP]])
++
++; CHECK: [[CP2]]:
++; CHECK-NEXT: [[CP2_TMP:.Ltmp[0-9]+]]:
++; CHECK-NEXT:     .long var(TLSGD)-(([[PCPOS2]]+4)-[[CP2_TMP]])
++
++entry:
++  br label %loop
++
++loop:
++  %i = phi i32 [ %inc, %next ], [ 0, %entry ]
++  %val = load i32, i32* @var
++  %tst = icmp eq i32 %val, 0
++  br i1 %tst, label %next, label %call
++
++call:
++  tail call void @foo(i32* nonnull @var) #2
++  br label %next
++
++next:
++  %inc = add i32 %i, 1
++  %stop = icmp eq i32 %inc, %n
++  br i1 %stop, label %done, label %loop
++
++done:
++  ret void
++}
++
++declare void @foo(i32*)
+\ No newline at end of file
+-- 
+1.9.1
+
